@@ -14,16 +14,17 @@
 
 // attach pins to HC-SR04
 #define kWheelEncoderPin 2
-#define kEchoPin 3
+#define kEchoPin 11
 #define kTrigPin 4
 
 #define USE_TIMER_1 true
 
 #include "TimerInterrupt.h"
-#define kTimer1IntervalMs 10
-#define kMeterPerResolution 3.1415926 * 0.02 * 2 / 50 // pi * r * 2 / resolution
+#define kTimer1IntervalMs 1000
+// 3.1415926 * 0.65 / 20 // pi * r * 2 / resolution
+#define kMeterPerResolution 0.1021
 
-enum RemoteControl { kRemoteControlStop = 0, kRemoteControlGo = 1 };
+enum RemoteControl { kRemoteControlManual = 0, kRemoteControlAuto = 1 };
 enum MotorDirection {
   kMotorDirectionBackward = -1,
   kMotorDirectionStop = 0,
@@ -37,11 +38,16 @@ SemaphoreHandle_t remote_control_signal;
 SemaphoreHandle_t pwm_setup_signal;
 
 volatile enum RobotBehavior behavior_policy = kRobotBehaviorGo;
-enum RemoteControl remote_control = kRemoteControlGo;
+enum RemoteControl remote_control = kRemoteControlAuto;
 
-int motor_pwm = 0;
+enum MotorDirection motor_manual_direction = kMotorDirectionStop;
+int motor_pwm = 0;      // Value is set based on potentiometer
+int left_motor_pwm = 0; // Values are set based on remote control commands
+int right_motor_pwm = 0;
+
 volatile float wheel_speed = 0.0;
 volatile unsigned long echo_initial_time = 0;
+volatile float object_distance = 0.0;
 volatile unsigned long wheel_encoder_cnt = 0;
 BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
@@ -55,6 +61,12 @@ void RightMotorControl(enum MotorDirection motor_direction, int pwm);
 
 // The setup function runs once when you press reset or power the board
 void setup() {
+
+  // pin change interrupt (example for D11: kEchoPin)
+  // Interrupt Service Routine: ISR(PCINT0_vect) {} // end of PCINT0_vect
+  PCMSK0 |= bit(PCINT3); // want pin 11
+  PCIFR |= bit(PCIF0);   // clear any outstanding interrupts
+  PCICR |= bit(PCIE0);   // enable pin change interrupts for D8 to D13
 
   policy_signal = xSemaphoreCreateBinary();
   wheel_speed_signal = xSemaphoreCreateBinary();
@@ -70,7 +82,6 @@ void setup() {
   }
 
   pinMode(kEchoPin, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(kEchoPin), HandleEcho, CHANGE);
   pinMode(kWheelEncoderPin, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(kWheelEncoderPin), HandleWheelEncoder,
                   RISING);
@@ -95,7 +106,7 @@ void setup() {
 
   xTaskCreate(TaskSerial,
               "Serial", // A name just for humans
-              128, // This stack size can be checked & adjusted by reading the
+              256, // This stack size can be checked & adjusted by reading the
                    // Stack Highwater
               NULL,
               1, // Priority, with 1 being the highest, and 4 being the lowest.
@@ -168,18 +179,34 @@ void MotorControl(void *pvParameters) {
   int local_motor_pwm = motor_pwm;
   enum RobotBehavior local_behavior_policy = behavior_policy;
   enum RemoteControl local_remote_control = remote_control;
+  enum MotorDirection local_motor_manual_direction = motor_manual_direction;
   for (;;) // A Task shall never return or exit.
   {
     /* Inspect our own high water mark on entering the task. */
     // Serial.print("Motor control highwater mark:");
     // Serial.println(uxTaskGetStackHighWaterMark(NULL));
+    // Serial.print("object distance: ");
+    // Serial.println(object_distance);
+    Serial.print("wheel speed: ");
+    Serial.println(local_wheel_speed);
     xTaskDelayUntil(&xLastWakeTime, 100 / portTICK_PERIOD_MS);
     if (xSemaphoreTake(remote_control_signal, (TickType_t)10) == pdTRUE) {
       local_remote_control = remote_control;
+      local_motor_manual_direction = motor_manual_direction;
     }
-    if (local_remote_control == kRemoteControlStop) {
-      LeftMotorControl(0, 0);
-      RightMotorControl(0, 0);
+    if (xSemaphoreTake(policy_signal, (TickType_t)10) == pdTRUE) {
+      local_behavior_policy = behavior_policy;
+    }
+    if (local_remote_control == kRemoteControlManual) {
+      if (local_behavior_policy == kRobotBehaviorDodge &&
+          motor_manual_direction == kMotorDirectionForward) {
+        LeftMotorControl(kMotorDirectionStop, 0);
+        RightMotorControl(kMotorDirectionStop, 0);
+        // digitalWrite(LED_BUILTIN, LOW);
+        continue;
+      }
+      LeftMotorControl(local_motor_manual_direction, left_motor_pwm);
+      RightMotorControl(local_motor_manual_direction, right_motor_pwm);
       continue;
     }
     if (xSemaphoreTake(pwm_setup_signal, (TickType_t)10) == pdTRUE) {
@@ -187,12 +214,6 @@ void MotorControl(void *pvParameters) {
     }
     if (xSemaphoreTake(wheel_speed_signal, (TickType_t)10) == pdTRUE) {
       local_wheel_speed = wheel_speed;
-    }
-    Serial.println(wheel_encoder_cnt);
-    Serial.println(local_wheel_speed);
-    Serial.println("----");
-    if (xSemaphoreTake(policy_signal, (TickType_t)10) == pdTRUE) {
-      local_behavior_policy = behavior_policy;
     }
     if (local_behavior_policy == kRobotBehaviorGo) {
       LeftMotorControl(kMotorDirectionForward, local_motor_pwm);
@@ -219,12 +240,13 @@ void HandleEchoRisingEdge() { echo_initial_time = micros(); }
 
 void HandleEchoFallingEdge() {
   long duration = micros() - echo_initial_time;
-  int distance = duration * 0.0344 / 2;
+  object_distance = duration * 0.0344 / 2;
+
   xHigherPriorityTaskWoken = pdFALSE;
-  if (distance == 0 || distance > kDistanceFar) {
+  if (object_distance == 0 || object_distance > kDistanceFar) {
     behavior_policy = kRobotBehaviorGo;
     xSemaphoreGiveFromISR(policy_signal, &xHigherPriorityTaskWoken);
-  } else if (distance < kDistanceNear) {
+  } else if (object_distance < kDistanceNear) {
     behavior_policy = kRobotBehaviorDodge;
     xSemaphoreGiveFromISR(policy_signal, &xHigherPriorityTaskWoken);
   }
@@ -242,6 +264,8 @@ void HandleEcho() {
   }
 }
 
+ISR(PCINT0_vect) { HandleEcho(); } // end of PCINT0_vect
+
 // the PWM pins:
 // - Pins 5 and 6: controlled by Timer 0
 // - Pins 9 and 10: controlled by timer 1
@@ -249,7 +273,7 @@ void HandleEcho() {
 void HandleTimer() {
   xHigherPriorityTaskWoken = pdFALSE;
   wheel_speed =
-      kMeterPerResolution * wheel_encoder_cnt / kTimer1IntervalMs * 1000;
+      kMeterPerResolution * wheel_encoder_cnt * 1000 / kTimer1IntervalMs;
   wheel_encoder_cnt = 0;
   xSemaphoreGiveFromISR(wheel_speed_signal, &xHigherPriorityTaskWoken);
   if (xHigherPriorityTaskWoken == pdTRUE) {
@@ -276,16 +300,53 @@ void TaskSerial(void * /*pvParameters*/) {
   TickType_t xLastWakeTime = xTaskGetTickCount();
   for (;;) // A Task shall never return or exit.
   {
+    // TODO(XP): Make the parsing faster!!!
     // Serial.print("serial highwater mark:");
     // Serial.println(uxTaskGetStackHighWaterMark(NULL));
-    xTaskDelayUntil(&xLastWakeTime, 100 / portTICK_PERIOD_MS);
+    xTaskDelayUntil(&xLastWakeTime, 5 / portTICK_PERIOD_MS);
     if (Serial.available() > 0) {
-      String command = Serial.readString();
-      if (command.indexOf("+") != -1) {
-        remote_control = kRemoteControlGo;
+      String command = Serial.readStringUntil('#');
+      // Serial.println(command);
+      int pos_s = 0;
+      int pos_e = command.indexOf(';', pos_s);
+      String local_mode = command.substring(pos_s, pos_e);
+      if (pos_e == -1) {
+        continue;
+      }
+      pos_s = pos_e + 1;
+      pos_e = command.indexOf(';', pos_s);
+      if (pos_e == -1) {
+        continue;
+      }
+      String s_motor_direction = command.substring(pos_s, pos_e);
+      pos_s = pos_e + 1;
+      pos_e = command.indexOf(';', pos_s);
+      if (pos_e == -1) {
+        continue;
+      }
+      String s_left_motor_pwm = command.substring(pos_s, pos_e);
+      pos_s = pos_e + 1;
+      pos_e = command.indexOf(';', pos_s);
+      if (pos_e == -1) {
+        continue;
+      }
+      String s_right_motor_pwm = command.substring(pos_s, pos_e);
+      left_motor_pwm = s_left_motor_pwm.toInt();
+      right_motor_pwm = s_right_motor_pwm.toInt();
+      if (local_mode == "A") {
+        remote_control = kRemoteControlAuto;
         xSemaphoreGive(remote_control_signal);
-      } else if (command.indexOf("-") != -1) {
-        remote_control = kRemoteControlStop;
+      } else {
+        left_motor_pwm = s_left_motor_pwm.toInt();
+        right_motor_pwm = s_right_motor_pwm.toInt();
+        if (s_motor_direction == "F") {
+          motor_manual_direction = kMotorDirectionForward;
+        } else if (s_motor_direction == "B") {
+          motor_manual_direction = kMotorDirectionBackward;
+        } else {
+          motor_manual_direction = kMotorDirectionStop;
+        }
+        remote_control = kRemoteControlManual;
         xSemaphoreGive(remote_control_signal);
       }
     }
