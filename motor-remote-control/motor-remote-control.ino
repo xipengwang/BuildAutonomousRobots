@@ -1,4 +1,5 @@
 #include <Arduino_FreeRTOS.h>
+#include <PID_v1.h>
 
 #include "semphr.h"
 
@@ -20,9 +21,9 @@
 #define USE_TIMER_1 true
 
 #include "TimerInterrupt.h"
-#define kTimer1IntervalMs 1000
-// 3.1415926 * 0.65 / 20 // pi * r * 2 / resolution
-#define kMeterPerResolution 0.1021
+#define kTimer1IntervalMs 100
+// 3.1415926 * 0.065 / 20 // pi * r * 2 / resolution
+#define kMeterPerResolution 0.01
 
 enum RemoteControl { kRemoteControlManual = 0, kRemoteControlAuto = 1 };
 enum MotorDirection {
@@ -44,10 +45,11 @@ enum MotorDirection motor_manual_direction = kMotorDirectionStop;
 int motor_pwm = 0;      // Value is set based on potentiometer
 int left_motor_pwm = 0; // Values are set based on remote control commands
 int right_motor_pwm = 0;
+double target_speed = 0.5; //[m/s]
 
-volatile float wheel_speed = 0.0;
+volatile double wheel_speed = 0.0;
 volatile unsigned long echo_initial_time = 0;
-volatile float object_distance = 0.0;
+volatile double object_distance = 0.0;
 volatile unsigned long wheel_encoder_cnt = 0;
 BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
@@ -59,9 +61,14 @@ void TaskSetPWM(void *pvParameters);
 void LeftMotorControl(enum MotorDirection motor_direction, int pwm);
 void RightMotorControl(enum MotorDirection motor_direction, int pwm);
 
+#define kMotorControlIntervalMs 150
+
+#define dir(x)                                                                 \
+  ((x) < 0 ? kMotorDirectionBackward                                           \
+           : ((x) > 0 ? kMotorDirectionForward : kMotorDirectionStop))
+
 // The setup function runs once when you press reset or power the board
 void setup() {
-
   // pin change interrupt (example for D11: kEchoPin)
   // Interrupt Service Routine: ISR(PCINT0_vect) {} // end of PCINT0_vect
   PCMSK0 |= bit(PCINT3); // want pin 11
@@ -77,8 +84,8 @@ void setup() {
 
   ITimer1.init();
   if (ITimer1.attachInterruptInterval(kTimer1IntervalMs, HandleTimer)) {
-    Serial.print(F("Starting  ITimer OK, millis() = "));
-    Serial.println(millis());
+    // Serial.print(F("Starting  ITimer OK, millis() = "));
+    // Serial.println(millis());
   }
 
   pinMode(kEchoPin, INPUT_PULLUP);
@@ -175,11 +182,21 @@ void MotorControl(void *pvParameters) {
   // initialize digital pin 13 as an output.
   // pinMode(LED_BUILTIN, OUTPUT);
 
-  float local_wheel_speed = wheel_speed;
+  double local_wheel_speed = wheel_speed;
+  // double local_target_speed = target_speed;
   int local_motor_pwm = motor_pwm;
   enum RobotBehavior local_behavior_policy = behavior_policy;
   enum RemoteControl local_remote_control = remote_control;
   enum MotorDirection local_motor_manual_direction = motor_manual_direction;
+
+  // Specify the links and initial tuning parameters
+  double Kp = 2.0, Ki = 1.0, Kd = 0;
+  double output_pwm;
+  PID speed_pid(&wheel_speed, &output_pwm, &target_speed, Kp, Ki, Kd, DIRECT);
+  speed_pid.SetMode(AUTOMATIC);
+  speed_pid.SetSampleTime(kMotorControlIntervalMs);
+  speed_pid.SetOutputLimits(0, 1);
+
   for (;;) // A Task shall never return or exit.
   {
     /* Inspect our own high water mark on entering the task. */
@@ -187,12 +204,16 @@ void MotorControl(void *pvParameters) {
     // Serial.println(uxTaskGetStackHighWaterMark(NULL));
     // Serial.print("object distance: ");
     // Serial.println(object_distance);
-    Serial.print("wheel speed: ");
-    Serial.println(local_wheel_speed);
-    xTaskDelayUntil(&xLastWakeTime, 100 / portTICK_PERIOD_MS);
+    xTaskDelayUntil(&xLastWakeTime,
+                    kMotorControlIntervalMs / portTICK_PERIOD_MS);
     if (xSemaphoreTake(remote_control_signal, (TickType_t)10) == pdTRUE) {
       local_remote_control = remote_control;
       local_motor_manual_direction = motor_manual_direction;
+      if (local_remote_control == kRemoteControlManual) {
+        speed_pid.SetMode(MANUAL);
+      } else {
+        speed_pid.SetMode(AUTOMATIC);
+      }
     }
     if (xSemaphoreTake(policy_signal, (TickType_t)10) == pdTRUE) {
       local_behavior_policy = behavior_policy;
@@ -215,12 +236,21 @@ void MotorControl(void *pvParameters) {
     if (xSemaphoreTake(wheel_speed_signal, (TickType_t)10) == pdTRUE) {
       local_wheel_speed = wheel_speed;
     }
+    if (abs(local_wheel_speed - target_speed) < 0.05) {
+      local_wheel_speed = target_speed;
+    }
+    speed_pid.Compute();
+    // Serial.print("target_speed:");
+    // Serial.print(10 * target_speed);
+    // Serial.print(",");
+    // Serial.print("real_speed:");
+    // Serial.println(10 * local_wheel_speed);
     if (local_behavior_policy == kRobotBehaviorGo) {
-      LeftMotorControl(kMotorDirectionForward, local_motor_pwm);
-      RightMotorControl(kMotorDirectionForward, local_motor_pwm);
+      LeftMotorControl(kMotorDirectionForward, output_pwm * local_motor_pwm);
+      RightMotorControl(kMotorDirectionForward, output_pwm * local_motor_pwm);
     } else if (local_behavior_policy == kRobotBehaviorDodge) {
       LeftMotorControl(kMotorDirectionStop, 0);
-      RightMotorControl(kMotorDirectionBackward, local_motor_pwm);
+      RightMotorControl(kMotorDirectionBackward, output_pwm * local_motor_pwm);
       // digitalWrite(LED_BUILTIN, LOW);
     }
   }
@@ -272,8 +302,9 @@ ISR(PCINT0_vect) { HandleEcho(); } // end of PCINT0_vect
 // - Pins 11 and 3: controlled by timer 2
 void HandleTimer() {
   xHigherPriorityTaskWoken = pdFALSE;
-  wheel_speed =
-      kMeterPerResolution * wheel_encoder_cnt * 1000 / kTimer1IntervalMs;
+  wheel_speed = 0.7 * wheel_speed + 0.3 * kMeterPerResolution *
+                                        wheel_encoder_cnt * 1000 /
+                                        kTimer1IntervalMs;
   wheel_encoder_cnt = 0;
   xSemaphoreGiveFromISR(wheel_speed_signal, &xHigherPriorityTaskWoken);
   if (xHigherPriorityTaskWoken == pdTRUE) {
