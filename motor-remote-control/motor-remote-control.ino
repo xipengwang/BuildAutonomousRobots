@@ -14,7 +14,8 @@
 #define kDistanceFar 80
 
 // attach pins to HC-SR04
-#define kWheelEncoderPin 2
+#define kRightWheelEncoderPin 2
+#define kLeftWheelEncoderPin 3
 #define kEchoPin 11
 #define kTrigPin 4
 
@@ -48,9 +49,12 @@ int right_motor_pwm = 0;
 double target_speed = 0.5; //[m/s]
 
 volatile double wheel_speed = 0.0;
+volatile double left_wheel_speed = 0.0;
+volatile double right_wheel_speed = 0.0;
 volatile unsigned long echo_initial_time = 0;
 volatile double object_distance = 0.0;
-volatile unsigned long wheel_encoder_cnt = 0;
+volatile unsigned long right_wheel_encoder_cnt = 0;
+volatile unsigned long left_wheel_encoder_cnt = 0;
 BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
 void MotorControl(void *pvParameters);
@@ -89,9 +93,12 @@ void setup() {
   }
 
   pinMode(kEchoPin, INPUT_PULLUP);
-  pinMode(kWheelEncoderPin, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(kWheelEncoderPin), HandleWheelEncoder,
-                  RISING);
+  pinMode(kRightWheelEncoderPin, INPUT_PULLUP);
+  pinMode(kLeftWheelEncoderPin, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(kRightWheelEncoderPin),
+                  HandleRightWheelEncoder, RISING);
+  attachInterrupt(digitalPinToInterrupt(kLeftWheelEncoderPin),
+                  HandleLeftWheelEncoder, RISING);
 
   /* // Now set up two tasks to run independently. */
   xTaskCreate(MotorControl,
@@ -240,11 +247,11 @@ void MotorControl(void *pvParameters) {
       local_wheel_speed = target_speed;
     }
     speed_pid.Compute();
-    // Serial.print("target_speed:");
-    // Serial.print(10 * target_speed);
+    // Serial.print("left_speed:");
+    // Serial.print(10 * left_wheel_speed);
     // Serial.print(",");
-    // Serial.print("real_speed:");
-    // Serial.println(10 * local_wheel_speed);
+    // Serial.print("right_speed:");
+    // Serial.println(10 * right_wheel_speed);
     if (local_behavior_policy == kRobotBehaviorGo) {
       LeftMotorControl(kMotorDirectionForward, output_pwm * local_motor_pwm);
       RightMotorControl(kMotorDirectionForward, output_pwm * local_motor_pwm);
@@ -302,17 +309,24 @@ ISR(PCINT0_vect) { HandleEcho(); } // end of PCINT0_vect
 // - Pins 11 and 3: controlled by timer 2
 void HandleTimer() {
   xHigherPriorityTaskWoken = pdFALSE;
-  wheel_speed = 0.7 * wheel_speed + 0.3 * kMeterPerResolution *
-                                        wheel_encoder_cnt * 1000 /
-                                        kTimer1IntervalMs;
-  wheel_encoder_cnt = 0;
+  left_wheel_speed = 0.7 * left_wheel_speed + 0.3 * kMeterPerResolution *
+                                                  right_wheel_encoder_cnt *
+                                                  1000 / kTimer1IntervalMs;
+  right_wheel_speed = 0.7 * right_wheel_speed + 0.3 * kMeterPerResolution *
+                                                    right_wheel_encoder_cnt *
+                                                    1000 / kTimer1IntervalMs;
+  right_wheel_encoder_cnt = 0;
+  left_wheel_encoder_cnt = 0;
+  // Hack
+  wheel_speed = right_wheel_speed;
   xSemaphoreGiveFromISR(wheel_speed_signal, &xHigherPriorityTaskWoken);
   if (xHigherPriorityTaskWoken == pdTRUE) {
     portYIELD_FROM_ISR();
   }
 }
 
-void HandleWheelEncoder() { wheel_encoder_cnt++; }
+void HandleLeftWheelEncoder() { left_wheel_encoder_cnt++; }
+void HandleRightWheelEncoder() { right_wheel_encoder_cnt++; }
 
 void CollisionAvoidance(void *pvParameters) {
 
