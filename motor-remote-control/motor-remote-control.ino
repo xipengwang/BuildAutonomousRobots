@@ -1,8 +1,12 @@
+#include <Wire.h>
+#include <math.h>
+
 #include <Arduino_FreeRTOS.h>
 #include <PID_v1.h>
 
 #include "semphr.h"
 
+#define MPU6050 0x68
 #define LeftMortorPin1 7
 #define LeftMortorPin2 8
 #define LeftMortorPwmPin 5
@@ -12,6 +16,8 @@
 
 #define kDistanceNear 60
 #define kDistanceFar 80
+
+#define motor_pwm 230
 
 // attach pins to HC-SR04
 #define kRightWheelEncoderPin 2
@@ -26,7 +32,6 @@
 // 3.1415926 * 0.065 / 20 // pi * r * 2 / resolution
 #define kMeterPerResolution 0.01
 
-enum RemoteControl { kRemoteControlManual = 0, kRemoteControlAuto = 1 };
 enum MotorDirection {
   kMotorDirectionBackward = -1,
   kMotorDirectionStop = 0,
@@ -36,16 +41,9 @@ enum RobotBehavior { kRobotBehaviorGo, kRobotBehaviorDodge };
 
 SemaphoreHandle_t policy_signal;
 SemaphoreHandle_t wheel_speed_signal;
-SemaphoreHandle_t remote_control_signal;
-SemaphoreHandle_t pwm_setup_signal;
 
 volatile enum RobotBehavior behavior_policy = kRobotBehaviorGo;
-enum RemoteControl remote_control = kRemoteControlAuto;
 
-enum MotorDirection motor_manual_direction = kMotorDirectionStop;
-int motor_pwm = 0;      // Value is set based on potentiometer
-int left_motor_pwm = 0; // Values are set based on remote control commands
-int right_motor_pwm = 0;
 double target_speed = 0.5; //[m/s]
 
 volatile double wheel_speed = 0.0;
@@ -57,10 +55,11 @@ volatile unsigned long right_wheel_encoder_cnt = 0;
 volatile unsigned long left_wheel_encoder_cnt = 0;
 BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
+float yaw_bias = 0.0;
+
 void MotorControl(void *pvParameters);
 void CollisionAvoidance(void *pvParameters);
-void TaskSerial(void *pvParameters);
-void TaskSetPWM(void *pvParameters);
+void HandleIMU(void *pvParameters);
 
 void LeftMotorControl(enum MotorDirection motor_direction, int pwm);
 void RightMotorControl(enum MotorDirection motor_direction, int pwm);
@@ -73,6 +72,16 @@ void RightMotorControl(enum MotorDirection motor_direction, int pwm);
 
 // The setup function runs once when you press reset or power the board
 void setup() {
+  constexpr int kMinimalCaliCnt = 200;
+  int cali_sample_cnt = 0;
+
+  StartIMU();
+  // TODO(XW): estimate the bias when speed is 0.
+  while (cali_sample_cnt < kMinimalCaliCnt) {
+    yaw_bias += QueryGyroZ();
+    cali_sample_cnt++;
+  }
+  yaw_bias /= kMinimalCaliCnt;
   // pin change interrupt (example for D11: kEchoPin)
   // Interrupt Service Routine: ISR(PCINT0_vect) {} // end of PCINT0_vect
   PCMSK0 |= bit(PCINT3); // want pin 11
@@ -81,17 +90,12 @@ void setup() {
 
   policy_signal = xSemaphoreCreateBinary();
   wheel_speed_signal = xSemaphoreCreateBinary();
-  remote_control_signal = xSemaphoreCreateBinary();
-  pwm_setup_signal = xSemaphoreCreateBinary();
-
-  Serial.begin(9600);
 
   ITimer1.init();
   if (ITimer1.attachInterruptInterval(kTimer1IntervalMs, HandleTimer)) {
     // Serial.print(F("Starting  ITimer OK, millis() = "));
     // Serial.println(millis());
   }
-
   pinMode(kEchoPin, INPUT_PULLUP);
   pinMode(kRightWheelEncoderPin, INPUT_PULLUP);
   pinMode(kLeftWheelEncoderPin, INPUT_PULLUP);
@@ -100,39 +104,13 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(kLeftWheelEncoderPin),
                   HandleLeftWheelEncoder, RISING);
 
-  /* // Now set up two tasks to run independently. */
-  xTaskCreate(MotorControl,
-              "MortorControl", // A name just for humans
-              256, // This stack size can be checked & adjusted by reading the
-                   // Stack Highwater
-              NULL,
-              2, // Priority, with 1 being the highest, and 4 being the lowest.
-              NULL);
+  xTaskCreate(MotorControl, "MortorControl", 256, NULL, 2, NULL);
 
-  // Now set up two tasks to run independently.
-  xTaskCreate(CollisionAvoidance,
-              "CollisionAvoidance", // A name just for humans
-              128, // This stack size can be checked & adjusted by reading the
-                   // Stack Highwater
-              NULL,
-              2, // Priority, with 1 being the highest, and 4 being the lowest.
-              NULL);
+  xTaskCreate(CollisionAvoidance, "CollisionAvoidance", 128, NULL, 2, NULL);
 
-  xTaskCreate(TaskSerial,
-              "Serial", // A name just for humans
-              256, // This stack size can be checked & adjusted by reading the
-                   // Stack Highwater
-              NULL,
-              1, // Priority, with 1 being the highest, and 4 being the lowest.
-              NULL);
+  xTaskCreate(HandleIMU, "HandleIMU", 256, NULL, 2, NULL);
 
-  xTaskCreate(TaskSetPWM,
-              "SetPWM", // A name just for humans
-              128, // This stack size can be checked & adjusted by reading the
-                   // Stack Highwater
-              NULL,
-              3, // Priority, with 1 being the highest, and 4 being the lowest.
-              NULL);
+  Serial.begin(9600);
 
   // Now the task scheduler, which takes over control of scheduling individual
   // tasks, is automatically started.
@@ -184,17 +162,13 @@ void MotorControl(void *pvParameters) {
   pinMode(RightMortorPin2, OUTPUT);
   pinMode(RightMortorPwmPin, OUTPUT);
 
-  TickType_t xLastWakeTime = xTaskGetTickCount();
+  // TickType_t xLastWakeTime = xTaskGetTickCount();
 
   // initialize digital pin 13 as an output.
   // pinMode(LED_BUILTIN, OUTPUT);
 
   double local_wheel_speed = wheel_speed;
-  // double local_target_speed = target_speed;
-  int local_motor_pwm = motor_pwm;
   enum RobotBehavior local_behavior_policy = behavior_policy;
-  enum RemoteControl local_remote_control = remote_control;
-  enum MotorDirection local_motor_manual_direction = motor_manual_direction;
 
   // Specify the links and initial tuning parameters
   double Kp = 2.0, Ki = 1.0, Kd = 0;
@@ -203,7 +177,7 @@ void MotorControl(void *pvParameters) {
   speed_pid.SetMode(AUTOMATIC);
   speed_pid.SetSampleTime(kMotorControlIntervalMs);
   speed_pid.SetOutputLimits(0, 1);
-
+  unsigned long current_time = 0, previous_time = 0;
   for (;;) // A Task shall never return or exit.
   {
     /* Inspect our own high water mark on entering the task. */
@@ -211,35 +185,18 @@ void MotorControl(void *pvParameters) {
     // Serial.println(uxTaskGetStackHighWaterMark(NULL));
     // Serial.print("object distance: ");
     // Serial.println(object_distance);
-    xTaskDelayUntil(&xLastWakeTime,
-                    kMotorControlIntervalMs / portTICK_PERIOD_MS);
-    if (xSemaphoreTake(remote_control_signal, (TickType_t)10) == pdTRUE) {
-      local_remote_control = remote_control;
-      local_motor_manual_direction = motor_manual_direction;
-      if (local_remote_control == kRemoteControlManual) {
-        speed_pid.SetMode(MANUAL);
-      } else {
-        speed_pid.SetMode(AUTOMATIC);
-      }
+    // xTaskDelayUntil(&xLastWakeTime,
+    //                 kMotorControlIntervalMs / portTICK_PERIOD_MS);
+
+    current_time = millis();
+    if (current_time - previous_time < kMotorControlIntervalMs) {
+      continue;
     }
+    previous_time = current_time;
     if (xSemaphoreTake(policy_signal, (TickType_t)10) == pdTRUE) {
       local_behavior_policy = behavior_policy;
     }
-    if (local_remote_control == kRemoteControlManual) {
-      if (local_behavior_policy == kRobotBehaviorDodge &&
-          motor_manual_direction == kMotorDirectionForward) {
-        LeftMotorControl(kMotorDirectionStop, 0);
-        RightMotorControl(kMotorDirectionStop, 0);
-        // digitalWrite(LED_BUILTIN, LOW);
-        continue;
-      }
-      LeftMotorControl(local_motor_manual_direction, left_motor_pwm);
-      RightMotorControl(local_motor_manual_direction, right_motor_pwm);
-      continue;
-    }
-    if (xSemaphoreTake(pwm_setup_signal, (TickType_t)10) == pdTRUE) {
-      local_motor_pwm = motor_pwm;
-    }
+
     if (xSemaphoreTake(wheel_speed_signal, (TickType_t)10) == pdTRUE) {
       local_wheel_speed = wheel_speed;
     }
@@ -247,17 +204,12 @@ void MotorControl(void *pvParameters) {
       local_wheel_speed = target_speed;
     }
     speed_pid.Compute();
-    // Serial.print("left_speed:");
-    // Serial.print(10 * left_wheel_speed);
-    // Serial.print(",");
-    // Serial.print("right_speed:");
-    // Serial.println(10 * right_wheel_speed);
     if (local_behavior_policy == kRobotBehaviorGo) {
-      LeftMotorControl(kMotorDirectionForward, output_pwm * local_motor_pwm);
-      RightMotorControl(kMotorDirectionForward, output_pwm * local_motor_pwm);
+      LeftMotorControl(kMotorDirectionForward, output_pwm * motor_pwm);
+      RightMotorControl(kMotorDirectionForward, output_pwm * motor_pwm);
     } else if (local_behavior_policy == kRobotBehaviorDodge) {
       LeftMotorControl(kMotorDirectionStop, 0);
-      RightMotorControl(kMotorDirectionBackward, output_pwm * local_motor_pwm);
+      RightMotorControl(kMotorDirectionBackward, output_pwm * motor_pwm);
       // digitalWrite(LED_BUILTIN, LOW);
     }
   }
@@ -333,81 +285,78 @@ void CollisionAvoidance(void *pvParameters) {
   (void)pvParameters;
   pinMode(kTrigPin, OUTPUT); // Sets the kTrigPin as an OUTPUT
   pinMode(kEchoPin, INPUT);  // Sets the echoPin as an INPUT
-  TickType_t xLastWakeTime = xTaskGetTickCount();
+                             // TickType_t xLastWakeTime = xTaskGetTickCount();
+  unsigned long current_time = 0, previous_time = 0;
   for (;;) {
-    xTaskDelayUntil(&xLastWakeTime, 100 / portTICK_PERIOD_MS);
+    // Serial.print("collision highwater mark:");
+    // Serial.println(uxTaskGetStackHighWaterMark(NULL));
+
+    // xTaskDelayUntil(&xLastWakeTime, 100 / portTICK_PERIOD_MS);
+    current_time = millis();
+    if (current_time - previous_time < 100) {
+      continue;
+    }
+    previous_time = current_time;
     SendPulse();
   }
 }
 
-void TaskSerial(void * /*pvParameters*/) {
+double WrapAngle(double x) {
+  x = fmod(x + 180, 360);
+  if (x < 0)
+    x += 360;
+  return x - 180;
+}
 
-  TickType_t xLastWakeTime = xTaskGetTickCount();
+void HandleIMU(void * /*pvParameters*/) {
+  // TickType_t xLastWakeTime = xTaskGetTickCount();
+  float previous_gyro_z = 0.0;
+  float gyro_z = 0.0;
+  bool first = true;
+  float yaw = 0;
+  unsigned long current_time, previous_time;
   for (;;) // A Task shall never return or exit.
   {
-    // TODO(XP): Make the parsing faster!!!
-    // Serial.print("serial highwater mark:");
-    // Serial.println(uxTaskGetStackHighWaterMark(NULL));
-    xTaskDelayUntil(&xLastWakeTime, 5 / portTICK_PERIOD_MS);
-    if (Serial.available() > 0) {
-      String command = Serial.readStringUntil('#');
-      // Serial.println(command);
-      int pos_s = 0;
-      int pos_e = command.indexOf(';', pos_s);
-      String local_mode = command.substring(pos_s, pos_e);
-      if (pos_e == -1) {
-        continue;
-      }
-      pos_s = pos_e + 1;
-      pos_e = command.indexOf(';', pos_s);
-      if (pos_e == -1) {
-        continue;
-      }
-      String s_motor_direction = command.substring(pos_s, pos_e);
-      pos_s = pos_e + 1;
-      pos_e = command.indexOf(';', pos_s);
-      if (pos_e == -1) {
-        continue;
-      }
-      String s_left_motor_pwm = command.substring(pos_s, pos_e);
-      pos_s = pos_e + 1;
-      pos_e = command.indexOf(';', pos_s);
-      if (pos_e == -1) {
-        continue;
-      }
-      String s_right_motor_pwm = command.substring(pos_s, pos_e);
-      left_motor_pwm = s_left_motor_pwm.toInt();
-      right_motor_pwm = s_right_motor_pwm.toInt();
-      if (local_mode == "A") {
-        remote_control = kRemoteControlAuto;
-        xSemaphoreGive(remote_control_signal);
-      } else {
-        left_motor_pwm = s_left_motor_pwm.toInt();
-        right_motor_pwm = s_right_motor_pwm.toInt();
-        if (s_motor_direction == "F") {
-          motor_manual_direction = kMotorDirectionForward;
-        } else if (s_motor_direction == "B") {
-          motor_manual_direction = kMotorDirectionBackward;
-        } else {
-          motor_manual_direction = kMotorDirectionStop;
-        }
-        remote_control = kRemoteControlManual;
-        xSemaphoreGive(remote_control_signal);
-      }
+    // xTaskDelayUntil(&xLastWakeTime, 50 / portTICK_PERIOD_MS);
+    if (millis() - previous_time < 50) {
+      continue;
     }
+    float gyro_z = QueryGyroZ() - yaw_bias;
+    current_time = millis();
+    if (first) {
+      previous_gyro_z = gyro_z;
+      previous_time = current_time;
+      first = false;
+      continue;
+    }
+    Serial.print("gyro_z:");
+    Serial.print(gyro_z);
+    Serial.print(",");
+    Serial.print("yaw:");
+    Serial.println(yaw);
+    current_time = millis();
+    yaw = WrapAngle(yaw + (previous_gyro_z + gyro_z) *
+                              (current_time - previous_time) / 2000);
+    previous_gyro_z = gyro_z;
+    previous_time = current_time;
   }
 }
 
-void TaskSetPWM(void * /*pvParameters*/) {
+void StartIMU() {
+  Wire.begin(); // Initialize comunication
+  Wire.beginTransmission(
+      MPU6050);               // Start communication with MPU6050 // MPU=0x68
+  Wire.write(0x6B);           // Talk to the register 6B
+  Wire.write(0);              // Make reset - place a 0 into the 6B register
+  Wire.endTransmission(true); // end the transmission
+}
 
-  TickType_t xLastWakeTime = xTaskGetTickCount();
-  for (;;) // A Task shall never return or exit.
-  {
-    // Serial.print("Set pwm highwater mark:");
-    // Serial.println(uxTaskGetStackHighWaterMark(NULL));
-    xTaskDelayUntil(&xLastWakeTime, 100 / portTICK_PERIOD_MS);
-    int sensor_value = analogRead(A0);
-    motor_pwm = (int)(sensor_value / 1024.0 * 250);
-    xSemaphoreGive(pwm_setup_signal);
+float QueryGyroZ() {
+  Wire.beginTransmission(MPU6050);
+  Wire.write(0x47);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU6050, 2, true);
+  if (Wire.available() == 2) {
+    return (Wire.read() << 8 | Wire.read()) / 131.0;
   }
 }
