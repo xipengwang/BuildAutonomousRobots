@@ -1,8 +1,12 @@
+#include <Wire.h>
+#include <math.h>
+
 #include <Arduino_FreeRTOS.h>
 #include <PID_v1.h>
 
 #include "semphr.h"
 
+#define MPU6050 0x68
 #define LeftMortorPin1 7
 #define LeftMortorPin2 8
 #define LeftMortorPwmPin 5
@@ -57,10 +61,13 @@ volatile unsigned long right_wheel_encoder_cnt = 0;
 volatile unsigned long left_wheel_encoder_cnt = 0;
 BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
+float yaw_bias = 0.0;
+
 void MotorControl(void *pvParameters);
 void CollisionAvoidance(void *pvParameters);
 void TaskSerial(void *pvParameters);
 void TaskSetPWM(void *pvParameters);
+void HandleIMU(void *pvParameters);
 
 void LeftMotorControl(enum MotorDirection motor_direction, int pwm);
 void RightMotorControl(enum MotorDirection motor_direction, int pwm);
@@ -73,6 +80,18 @@ void RightMotorControl(enum MotorDirection motor_direction, int pwm);
 
 // The setup function runs once when you press reset or power the board
 void setup() {
+
+  constexpr int kMinimalCaliCnt = 200;
+  int cali_sample_cnt = 0;
+
+  StartIMU();
+  // TODO(XW): estimate the bias when speed is 0.
+  while (cali_sample_cnt < kMinimalCaliCnt) {
+    yaw_bias += QueryGyroZ();
+    cali_sample_cnt++;
+  }
+  yaw_bias /= kMinimalCaliCnt;
+
   // pin change interrupt (example for D11: kEchoPin)
   // Interrupt Service Routine: ISR(PCINT0_vect) {} // end of PCINT0_vect
   PCMSK0 |= bit(PCINT3); // want pin 11
@@ -100,40 +119,15 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(kLeftWheelEncoderPin),
                   HandleLeftWheelEncoder, RISING);
 
-  /* // Now set up two tasks to run independently. */
-  xTaskCreate(MotorControl,
-              "MortorControl", // A name just for humans
-              256, // This stack size can be checked & adjusted by reading the
-                   // Stack Highwater
-              NULL,
-              2, // Priority, with 1 being the highest, and 4 being the lowest.
-              NULL);
+  xTaskCreate(MotorControl, "MortorControl", 256, NULL, 2, NULL);
 
-  // Now set up two tasks to run independently.
-  xTaskCreate(CollisionAvoidance,
-              "CollisionAvoidance", // A name just for humans
-              128, // This stack size can be checked & adjusted by reading the
-                   // Stack Highwater
-              NULL,
-              2, // Priority, with 1 being the highest, and 4 being the lowest.
-              NULL);
+  xTaskCreate(CollisionAvoidance, "CollisionAvoidance", 128, NULL, 2, NULL);
 
-  xTaskCreate(TaskSerial,
-              "Serial", // A name just for humans
-              256, // This stack size can be checked & adjusted by reading the
-                   // Stack Highwater
-              NULL,
-              1, // Priority, with 1 being the highest, and 4 being the lowest.
-              NULL);
+  xTaskCreate(TaskSerial, "Serial", 256, NULL, 1, NULL);
 
-  xTaskCreate(TaskSetPWM,
-              "SetPWM", // A name just for humans
-              128, // This stack size can be checked & adjusted by reading the
-                   // Stack Highwater
-              NULL,
-              3, // Priority, with 1 being the highest, and 4 being the lowest.
-              NULL);
+  xTaskCreate(TaskSetPWM, "SetPWM", 128, NULL, 3, NULL);
 
+  xTaskCreate(HandleIMU, "HandleIMU", 256, NULL, 2, NULL);
   // Now the task scheduler, which takes over control of scheduling individual
   // tasks, is automatically started.
 }
@@ -184,8 +178,8 @@ void MotorControl(void *pvParameters) {
   pinMode(RightMortorPin2, OUTPUT);
   pinMode(RightMortorPwmPin, OUTPUT);
 
-  TickType_t xLastWakeTime = xTaskGetTickCount();
-
+  // TickType_t xLastWakeTime = xTaskGetTickCount();
+  unsigned long current_time = 0, previous_time = 0;
   // initialize digital pin 13 as an output.
   // pinMode(LED_BUILTIN, OUTPUT);
 
@@ -211,8 +205,13 @@ void MotorControl(void *pvParameters) {
     // Serial.println(uxTaskGetStackHighWaterMark(NULL));
     // Serial.print("object distance: ");
     // Serial.println(object_distance);
-    xTaskDelayUntil(&xLastWakeTime,
-                    kMotorControlIntervalMs / portTICK_PERIOD_MS);
+    // xTaskDelayUntil(&xLastWakeTime,
+    //                 kMotorControlIntervalMs / portTICK_PERIOD_MS);
+    current_time = millis();
+    if (current_time - previous_time < kMotorControlIntervalMs) {
+      continue;
+    }
+    previous_time = current_time;
     if (xSemaphoreTake(remote_control_signal, (TickType_t)10) == pdTRUE) {
       local_remote_control = remote_control;
       local_motor_manual_direction = motor_manual_direction;
@@ -333,22 +332,36 @@ void CollisionAvoidance(void *pvParameters) {
   (void)pvParameters;
   pinMode(kTrigPin, OUTPUT); // Sets the kTrigPin as an OUTPUT
   pinMode(kEchoPin, INPUT);  // Sets the echoPin as an INPUT
-  TickType_t xLastWakeTime = xTaskGetTickCount();
+                             // TickType_t xLastWakeTime = xTaskGetTickCount();
+  unsigned long current_time = 0, previous_time = 0;
+
   for (;;) {
-    xTaskDelayUntil(&xLastWakeTime, 100 / portTICK_PERIOD_MS);
+    current_time = millis();
+    if (current_time - previous_time < 100) {
+      continue;
+    }
+    previous_time = current_time;
+    // xTaskDelayUntil(&xLastWakeTime, 100 / portTICK_PERIOD_MS);
     SendPulse();
   }
 }
 
 void TaskSerial(void * /*pvParameters*/) {
 
-  TickType_t xLastWakeTime = xTaskGetTickCount();
+  // TickType_t xLastWakeTime = xTaskGetTickCount();
+  unsigned long current_time = 0, previous_time = 0;
+
   for (;;) // A Task shall never return or exit.
   {
     // TODO(XP): Make the parsing faster!!!
     // Serial.print("serial highwater mark:");
     // Serial.println(uxTaskGetStackHighWaterMark(NULL));
-    xTaskDelayUntil(&xLastWakeTime, 5 / portTICK_PERIOD_MS);
+    // xTaskDelayUntil(&xLastWakeTime, 5 / portTICK_PERIOD_MS);
+    current_time = millis();
+    if (current_time - previous_time < 10) {
+      continue;
+    }
+    previous_time = current_time;
     if (Serial.available() > 0) {
       String command = Serial.readStringUntil('#');
       // Serial.println(command);
@@ -400,14 +413,80 @@ void TaskSerial(void * /*pvParameters*/) {
 
 void TaskSetPWM(void * /*pvParameters*/) {
 
-  TickType_t xLastWakeTime = xTaskGetTickCount();
+  unsigned long current_time = 0, previous_time = 0;
+  // TickType_t xLastWakeTime = xTaskGetTickCount();
   for (;;) // A Task shall never return or exit.
   {
     // Serial.print("Set pwm highwater mark:");
     // Serial.println(uxTaskGetStackHighWaterMark(NULL));
-    xTaskDelayUntil(&xLastWakeTime, 100 / portTICK_PERIOD_MS);
+    // xTaskDelayUntil(&xLastWakeTime, 100 / portTICK_PERIOD_MS);
+    current_time = millis();
+    if (current_time - previous_time < 100) {
+      continue;
+    }
+    previous_time = current_time;
     int sensor_value = analogRead(A0);
     motor_pwm = (int)(sensor_value / 1024.0 * 250);
     xSemaphoreGive(pwm_setup_signal);
+  }
+}
+
+double WrapAngle(double x) {
+  x = fmod(x + 180, 360);
+  if (x < 0)
+    x += 360;
+  return x - 180;
+}
+
+void HandleIMU(void * /*pvParameters*/) {
+  // TickType_t xLastWakeTime = xTaskGetTickCount();
+  float previous_gyro_z = 0.0;
+  float gyro_z = 0.0;
+  bool first = true;
+  float yaw = 0;
+  unsigned long current_time, previous_time;
+  for (;;) // A Task shall never return or exit.
+  {
+    // xTaskDelayUntil(&xLastWakeTime, 50 / portTICK_PERIOD_MS);
+    if (millis() - previous_time < 50) {
+      continue;
+    }
+    float gyro_z = QueryGyroZ() - yaw_bias;
+    current_time = millis();
+    if (first) {
+      previous_gyro_z = gyro_z;
+      previous_time = current_time;
+      first = false;
+      continue;
+    }
+    Serial.print("gyro_z:");
+    Serial.print(gyro_z);
+    Serial.print(",");
+    Serial.print("yaw:");
+    Serial.println(yaw);
+    current_time = millis();
+    yaw = WrapAngle(yaw + (previous_gyro_z + gyro_z) *
+                              (current_time - previous_time) / 2000);
+    previous_gyro_z = gyro_z;
+    previous_time = current_time;
+  }
+}
+
+void StartIMU() {
+  Wire.begin(); // Initialize comunication
+  Wire.beginTransmission(
+      MPU6050);               // Start communication with MPU6050 // MPU=0x68
+  Wire.write(0x6B);           // Talk to the register 6B
+  Wire.write(0);              // Make reset - place a 0 into the 6B register
+  Wire.endTransmission(true); // end the transmission
+}
+
+float QueryGyroZ() {
+  Wire.beginTransmission(MPU6050);
+  Wire.write(0x47);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU6050, 2, true);
+  if (Wire.available() == 2) {
+    return (Wire.read() << 8 | Wire.read()) / 131.0;
   }
 }
